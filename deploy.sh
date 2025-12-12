@@ -138,9 +138,14 @@ if [ ! -f "infrastructure.yaml" ]; then
     exit 1
 fi
 
+# Create CFN templates bucket if needed
+CFN_BUCKET="cfn-templates-${ACCOUNT_ID}"
+aws s3 mb s3://$CFN_BUCKET 2>/dev/null || echo "CFN bucket already exists"
+
 aws cloudformation deploy \
   --template-file infrastructure.yaml \
   --stack-name $STACK_NAME \
+  --s3-bucket $CFN_BUCKET \
   --parameter-overrides \
     ResourcePrefix=$RESOURCE_PREFIX \
     BucketName=$BUCKET_PREFIX \

@@ -212,17 +212,24 @@ Agent: [Generates Python code, executes it, returns chart image]
 
 ## Configuration
 
-### Update Model (Claude 3.7 Sonnet)
+### Update Model
 
-To use the latest Claude 3.7 Sonnet model:
+To use a different model, edit `deploy.sh` and find the `--model-id` parameter (around line 235):
 
 ```bash
-# Edit deploy.sh, line 235:
+# Current default:
+--model-id anthropic.claude-3-5-sonnet-20240620-v1:0
+
+# Change to Claude 3.7 Sonnet (latest):
 --model-id us.anthropic.claude-3-7-sonnet-20250219-v1:0
+
+# Or use Claude 3.5 Haiku for lower cost:
+--model-id anthropic.claude-3-5-haiku-20241022-v1:0
 ```
 
 Then redeploy:
 ```bash
+bash destroy.sh
 bash deploy.sh
 ```
 

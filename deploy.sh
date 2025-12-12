@@ -287,7 +287,7 @@ if [ -f "deploy_spa_multi_agent_system_v8.py" ]; then
             AGENT_RUNTIME_ARN=$(grep -o '"agent_arn": "[^"]*"' ${AGENT_NAME}_deployment.json | cut -d'"' -f4)
         else
             # Fallback: list agents and find by name
-            AGENT_RUNTIME_ARN=$(aws bedrock-agentcore list-agent-runtimes --region $REGION --query "agentRuntimes[?contains(agentRuntimeArn, '$AGENT_NAME')].agentRuntimeArn" --output text | head -1)
+            AGENT_RUNTIME_ARN=$(aws bedrock-agentcore-control list-agent-runtimes --region $REGION --query "agentRuntimes[?contains(agentRuntimeArn, '$AGENT_NAME')].agentRuntimeArn" --output text | head -1)
         fi
         
         if [ -z "$AGENT_RUNTIME_ARN" ]; then

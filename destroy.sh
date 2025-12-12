@@ -20,7 +20,7 @@ for DEPLOY_FILE in *_deployment.json; do
         if [ ! -z "$AGENT_ARN" ]; then
             AGENT_ID=$(echo $AGENT_ARN | rev | cut -d'/' -f1 | rev)
             echo "  Deleting agent from $DEPLOY_FILE: $AGENT_ID"
-            aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-arn $AGENT_ARN --region $REGION 2>/dev/null || echo "  Failed to delete $AGENT_ID"
+            aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id $AGENT_ARN --region $REGION 2>/dev/null || echo "  Failed to delete $AGENT_ID"
         fi
     fi
 done

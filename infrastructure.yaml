@@ -1,0 +1,1746 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'React Chat App with Cognito, S3, CloudFront, and Knowledge Base'
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: ChatApp
+    Description: Prefix for all resource names
+  BucketName:
+    Type: String
+    Default: react-chat-app-bucket
+    Description: S3 bucket name for hosting
+  LayerBucketName:
+    Type: String
+    Description: S3 bucket name for Lambda Layer
+  LayerS3Key:
+    Type: String
+    Default: python-jose-layer.zip
+    Description: S3 key for Lambda Layer zip
+  KnowledgeBaseBucketName:
+    Type: String
+    Description: Existing S3 bucket for Knowledge Base data
+  GlueCatalogBucketName:
+    Type: String
+    Description: Existing S3 bucket for Glue catalog export
+  SAPSecretName:
+    Type: String
+    Default: SAPDEMOCRED
+    Description: Name for SAP credentials secret in Secrets Manager
+
+Resources:
+  # VPC Configuration
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-VPC"
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-Public-1"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-Public-2"
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-Private-1"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-Private-2"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-IGW"
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  EIP1:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+
+  EIP2:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+
+  NATGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIP1.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-NAT-1"
+
+  NATGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIP2.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-NAT-2"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-Public-RT"
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-Private-RT-1"
+
+  PrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-Private-RT-2"
+
+  PrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway2
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable2
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Lambda functions
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic for Lambda functions
+      Tags:
+        - Key: Name
+          Value: !Sub "${ResourcePrefix}-Lambda-SG"
+
+  # KMS Key for SQS DLQ
+  SQSKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for SQS DLQ encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+  # DLQ for Lambda Functions
+  LambdaDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ResourcePrefix}-Lambda-DLQ"
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !Ref SQSKMSKey
+
+  # S3 Bucket for Logging
+  # Note: LoggingConfiguration intentionally omitted to avoid recursive logging (bucket cannot log to itself)
+  # checkov:skip=CKV_AWS_18:Logging bucket cannot have logging enabled (recursive dependency)
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: S3_BUCKET_LOGGING_ENABLED
+            reason: "Logging bucket cannot have logging enabled (recursive dependency)"
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_LOGGING_ENABLED
+    Properties:
+      BucketName: !Sub "${BucketName}-logs-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+
+  # S3 Bucket (Private)
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${BucketName}-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: s3-access-logs/
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # Origin Access Control
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ResourcePrefix}OriginAccessControl"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # S3 Bucket Policy (OAC Only)
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn: CloudFrontDistribution
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${WebsiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                "AWS:SourceArn": !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub "${WebsiteBucket.Arn}/*"
+              - !GetAtt WebsiteBucket.Arn
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+  # WAF WebACL for CloudFront
+  WebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${ResourcePrefix}WebACL"
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      Rules:
+        - Name: RateLimitRule
+          Priority: 1
+          Statement:
+            RateBasedStatement:
+              Limit: 2000
+              AggregateKeyType: IP
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitRule
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 2
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesCommonRuleSet
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 3
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesKnownBadInputsRuleSet
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${ResourcePrefix}WebACL"
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn: WebACL
+    Properties:
+      DistributionConfig:
+        WebACLId: !GetAtt WebACL.Arn
+        Logging:
+          Bucket: !GetAtt LoggingBucket.DomainName
+          Prefix: cloudfront-logs/
+          IncludeCookies: false
+        Origins:
+          - DomainName: !GetAtt WebsiteBucket.RegionalDomainName
+            Id: S3Origin
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !Ref OriginAccessControl
+        Enabled: true
+        DefaultRootObject: index.html
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.2_2021
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          ForwardedValues:
+            QueryString: false
+          Compress: true
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        PriceClass: PriceClass_100
+
+  # Cognito User Pool
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${ResourcePrefix}UserPool"
+      AutoVerifiedAttributes:
+        - email
+      UsernameConfiguration:
+        CaseSensitive: false
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: false
+          RequireLowercase: false
+          RequireNumbers: false
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+
+  # Cognito User Pool Client
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub "${ResourcePrefix}UserPoolClient"
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  # KMS Key for DynamoDB Encryption
+  DynamoDBKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for DynamoDB table encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+  # DynamoDB Table for WebSocket Connections
+  ConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ResourcePrefix}ConnectionsTable"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: connectionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: connectionId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DynamoDBKMSKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ========================================
+  # KNOWLEDGE BASE COMPONENTS START
+  # ========================================
+
+  # Random String Generator for unique KB names
+  RandomStringFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      ReservedConcurrentExecutions: 5
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Code:
+        ZipFile: |
+          import json
+          import cfnresponse
+          import random
+          import string
+          
+          def generate_random_string(length=6):
+              letters = string.ascii_lowercase
+              digits = string.digits
+              result = random.choice(letters)
+              result += random.choice(digits)
+              remaining_length = length - 2
+              remaining_chars = ''.join(random.choices(letters + digits, k=remaining_length))
+              result += remaining_chars
+              chars = list(result[1:])
+              random.shuffle(chars)
+              return result[0] + ''.join(chars)
+          
+          def lambda_handler(event, context):
+              responseData = {}
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      string1 = generate_random_string()
+                      string2 = generate_random_string()
+                      while string2 == string1:
+                          string2 = generate_random_string()
+                      responseData['RandomString1'] = string1
+                      responseData['RandomString2'] = string2
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      Runtime: "python3.12"
+      Timeout: 60
+
+  GenerateRandomStrings:
+    Type: Custom::RandomString
+    Properties:
+      ServiceToken: !GetAtt RandomStringFunction.Arn
+
+  # Note: SupplierBucket created by deploy.sh, referenced via parameter
+
+  # Knowledge Base IAM Role
+  SupplierKBRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AmazonBedrockKnowledgeBaseTrustPolicy
+            Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*"
+
+  SupplierKBRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "supplierkbpolicy-${AWS::StackName}"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: 
+              - "bedrock:InvokeModel"
+              - "bedrock:CreateKnowledgeBase"
+              - "bedrock:ListFoundationModels"
+              - "bedrock:ListCustomModels"
+              - "bedrock:Retrieve"
+              - "bedrock:Search"
+              - "bedrock:GetKnowledgeBase"
+              - "bedrock:ListKnowledgeBases"
+            Resource: 
+              - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"
+              - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*"
+          - Effect: Allow
+            Action:
+              - "aoss:APIAccessAll"
+              - "aoss:CreateIndex"
+              - "aoss:DeleteIndex"
+              - "aoss:UpdateIndex"
+              - "aoss:DescribeIndex"
+              - "aoss:ReadDocument"
+              - "aoss:WriteDocument"
+              - "aoss:BatchGetCollection"
+              - "aoss:CreateCollection"
+              - "aoss:DeleteCollection"
+              - "aoss:UpdateCollection"
+              - "aoss:CreateCollectionItems"
+              - "aoss:DeleteCollectionItems"
+              - "aoss:UpdateCollectionItems"
+              - "aoss:DescribeCollectionItems"
+            Resource: !Sub "arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*"
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !Sub "arn:aws:s3:::${KnowledgeBaseBucketName}"
+              - !Sub "arn:aws:s3:::${KnowledgeBaseBucketName}/*"
+      Roles:
+        - !Ref SupplierKBRole
+
+  # OpenSearch Serverless Encryption Policy
+  OpenSearchEncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub "kb-enc-${GenerateRandomStrings.RandomString1}"
+      Type: "encryption"
+      Description: "Encryption policy for Knowledge Base collection"
+      Policy: !Sub |
+        {
+          "Rules": [
+            {
+              "ResourceType": "collection",
+              "Resource": ["collection/kb-col-${GenerateRandomStrings.RandomString1}"]
+            }
+          ],
+          "AWSOwnedKey": true
+        }
+
+  # OpenSearch Serverless Collection
+  OpenSearchCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    DependsOn: OpenSearchEncryptionPolicy
+    Properties:
+      Name: !Sub "kb-col-${GenerateRandomStrings.RandomString1}"
+      Description: "Vector store for Knowledge Base"
+      Type: "VECTORSEARCH"
+      StandbyReplicas: "DISABLED"
+
+  # OpenSearch Network Policy
+  OpenSearchSecurityPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    DependsOn: OpenSearchCollection
+    Properties:
+      Name: !Sub "kb-net-${GenerateRandomStrings.RandomString1}"
+      Type: "network"
+      Description: "Network policy for Knowledge Base"
+      Policy: !Sub |
+        [{
+          "Rules":[
+            {
+              "ResourceType": "collection",
+              "Resource": ["collection/kb-col-${GenerateRandomStrings.RandomString1}"]
+            },
+            {
+              "ResourceType": "dashboard",
+              "Resource": ["collection/kb-col-${GenerateRandomStrings.RandomString1}"]
+            }
+          ],
+          "AllowFromPublic": true
+        }]
+
+  # OpenSearch Access Policy
+  OpenSearchAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    DependsOn: [OpenSearchCollection, OpenSearchSecurityPolicy]
+    Properties:
+      Name: !Sub "kb-acc-${GenerateRandomStrings.RandomString2}"
+      Type: "data"
+      Description: "Access policy for Knowledge Base"
+      Policy: !Sub |
+        [{
+          "Rules": [
+            {
+              "ResourceType": "collection",
+              "Resource": ["collection/kb-col-${GenerateRandomStrings.RandomString1}"],
+              "Permission": [
+                "aoss:DescribeCollectionItems",
+                "aoss:CreateCollectionItems",
+                "aoss:UpdateCollectionItems"
+              ]
+            },
+            {
+              "ResourceType": "index",
+              "Resource": ["index/kb-col-${GenerateRandomStrings.RandomString1}/*"],
+              "Permission": [
+                "aoss:UpdateIndex",
+                "aoss:DescribeIndex",
+                "aoss:ReadDocument",
+                "aoss:WriteDocument",
+                "aoss:CreateIndex"
+              ]
+            }
+          ],
+          "Principal": [
+            "${SupplierKBRole.Arn}",
+            "${KBLambdaExecutionRole.Arn}"
+          ],
+          "Description": "Access policy for Bedrock Knowledge Base"
+        }]
+
+  # Lambda Role for Vector Index Creation
+  KBLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      Policies:
+        - PolicyName: DLQAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt LambdaDLQ.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt SQSKMSKey.Arn
+        - PolicyName: OpenSearchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'aoss:CreateIndex'
+                  - 'aoss:DeleteIndex'
+                  - 'aoss:UpdateIndex'
+                  - 'aoss:DescribeIndex'
+                  - 'aoss:ReadDocument'
+                  - 'aoss:WriteDocument'
+                  - 'aoss:CreateCollectionItems'
+                  - 'aoss:DeleteCollectionItems'
+                  - 'aoss:UpdateCollectionItems'
+                  - 'aoss:DescribeCollectionItems'
+                  - 'aoss:APIAccessAll'
+                Resource: !Sub 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
+
+  # Lambda Layer for opensearch-py
+  OpenSearchLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub "${ResourcePrefix}OpenSearchLayer"
+      Description: opensearch-py layer for Lambda
+      Content:
+        S3Bucket: !Ref LayerBucketName
+        S3Key: "opensearch-layer.zip"
+      CompatibleRuntimes:
+        - python3.12
+
+  # Vector Index Creation Lambda
+  VectorIndexFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: OpenSearchCollection
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt KBLambdaExecutionRole.Arn
+      ReservedConcurrentExecutions: 5
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import os
+          import time
+          from opensearchpy import OpenSearch, RequestsHttpConnection, AWSV4SignerAuth
+
+          def handler(event, context):
+            try:
+              if event['RequestType'] in ['Create', 'Update']:
+                print(f"Waiting 90 seconds for OpenSearch collection to be ready...")
+                time.sleep(90)
+                
+                session = boto3.Session()
+                credentials = session.get_credentials()
+                region = session.region_name
+                auth = AWSV4SignerAuth(credentials, region, service='aoss')
+                collection_endpoint = os.environ['COLLECTION_ENDPOINT'].replace('https://', '')
+                
+                print(f"Connecting to OpenSearch: {collection_endpoint}")
+                client = OpenSearch(
+                  hosts=[{'host': collection_endpoint, 'port': 443}],
+                  http_auth=auth,
+                  use_ssl=True,
+                  verify_certs=True,
+                  connection_class=RequestsHttpConnection,
+                  timeout=300
+                )
+                
+                index_name = "bedrock-knowledge-base-default-index"
+                
+                # Check if index already exists
+                if client.indices.exists(index=index_name):
+                    print(f"Index {index_name} already exists")
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                    return
+                
+                print(f"Creating index: {index_name}")
+                index_body = {
+                  "settings": {"index": {"knn": True, "knn.algo_param.ef_search": 512}},
+                  "mappings": {
+                    "properties": {
+                      "bedrock-knowledge-base-default-vector": {
+                        "type": "knn_vector",
+                        "dimension": 1024,
+                        "method": {"engine": "faiss", "name": "hnsw", "space_type": "l2", "parameters": {"ef_construction": 512, "m": 16}}
+                      },
+                      "AMAZON_BEDROCK_METADATA": {"type": "text", "index": False},
+                      "AMAZON_BEDROCK_TEXT_CHUNK": {"type": "text", "index": True},
+                      "id": {"type": "text", "index": True},
+                      "x-amz-bedrock-kb-data-source-id": {"type": "text", "index": True},
+                      "x-amz-bedrock-kb-source-uri": {"type": "text", "index": True}
+                    }
+                  }
+                }
+                response = client.indices.create(index=index_name, body=index_body)
+                print(f"Index created successfully: {response}")
+                
+                # Wait for index to be fully ready
+                print("Waiting 30 seconds for index to be fully ready...")
+                time.sleep(30)
+                
+                # Verify index is accessible
+                index_info = client.indices.get(index=index_name)
+                print(f"Index verified: {index_info}")
+                
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              else:
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+            except Exception as e:
+              print(f"ERROR: {str(e)}")
+              import traceback
+              traceback.print_exc()
+              cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+      Environment:
+        Variables:
+          COLLECTION_ENDPOINT: !GetAtt OpenSearchCollection.CollectionEndpoint
+      KmsKeyArn: !GetAtt SQSKMSKey.Arn
+      Runtime: "python3.12"
+      Timeout: 900
+      Layers:
+        - !Ref OpenSearchLayer
+
+  CreateVectorIndex:
+    Type: Custom::CreateVectorIndex
+    DependsOn: 
+      - OpenSearchAccessPolicy
+      - OpenSearchSecurityPolicy
+      - OpenSearchCollection
+      - KBLambdaExecutionRole
+    Properties:
+      ServiceToken: !GetAtt VectorIndexFunction.Arn
+
+  # Bedrock Knowledge Base
+  SupplierKnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    DependsOn: CreateVectorIndex
+    Properties:
+      Name: "Table_Structure_KB"
+      Description: "Knowledge base for supplier sustainability information"
+      RoleArn: !GetAtt SupplierKBRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: "VECTOR"
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"       
+      StorageConfiguration:
+        Type: "OPENSEARCH_SERVERLESS"
+        OpensearchServerlessConfiguration:
+          CollectionArn: !GetAtt OpenSearchCollection.Arn
+          VectorIndexName: "bedrock-knowledge-base-default-index"
+          FieldMapping:
+            VectorField: "bedrock-knowledge-base-default-vector"
+            TextField: "AMAZON_BEDROCK_TEXT_CHUNK"
+            MetadataField: "AMAZON_BEDROCK_METADATA"
+
+  # Knowledge Base Data Source
+  SupplierDataSource:
+    Type: AWS::Bedrock::DataSource
+    DependsOn: SupplierKnowledgeBase
+    Properties:
+      Name: "SupplierS3DataSource"
+      KnowledgeBaseId: !Ref SupplierKnowledgeBase
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !Sub "arn:aws:s3:::${KnowledgeBaseBucketName}"
+
+  # ========================================
+  # KNOWLEDGE BASE COMPONENTS END
+  # ========================================
+
+  # ========================================
+  # SAP CREDENTIALS SECRET
+  # ========================================
+
+  # KMS Key for Secrets Manager
+  SecretsKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for Secrets Manager encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+  SAPCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Ref SAPSecretName
+      Description: SAP credentials for RFQ Assistant
+      SecretString: '{"SAPUSER":"","SAPPASSWORD":""}'
+      KmsKeyId: !Ref SecretsKMSKey
+
+  # ========================================
+  # GLUE CRAWLERS
+  # ========================================
+
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::sapdata-${AWS::AccountId}"
+                  - !Sub "arn:aws:s3:::sapdata-${AWS::AccountId}/*"
+                  - !Sub "arn:aws:s3:::compliancedata-${AWS::AccountId}"
+                  - !Sub "arn:aws:s3:::compliancedata-${AWS::AccountId}/*"
+
+  CSVClassifier:
+    Type: AWS::Glue::Classifier
+    Properties:
+      CsvClassifier:
+        Name: !Sub "${ResourcePrefix}-csv-classifier"
+        ContainsHeader: PRESENT
+        Delimiter: ","
+        QuoteSymbol: '"'
+
+  # Glue Security Configuration
+  GlueSecurityConfig:
+    Type: AWS::Glue::SecurityConfiguration
+    Properties:
+      Name: !Sub "${ResourcePrefix}-glue-security-config"
+      EncryptionConfiguration:
+        S3Encryptions:
+          - S3EncryptionMode: SSE-S3
+        CloudWatchEncryption:
+          CloudWatchEncryptionMode: SSE-KMS
+          KmsKeyArn: !GetAtt CloudWatchLogsKMSKey.Arn
+
+  SAPDataCrawler:
+    Type: AWS::Glue::Crawler
+    DependsOn: GlueCrawlerRole
+    Properties:
+      Name: !Sub "${ResourcePrefix}-sap-data-crawler"
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: sapdatadb
+      CrawlerSecurityConfiguration: !Ref GlueSecurityConfig
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://sapdata-${AWS::AccountId}/source/"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  CompDataCrawler:
+    Type: AWS::Glue::Crawler
+    DependsOn: GlueCrawlerRole
+    Properties:
+      Name: !Sub "${ResourcePrefix}-comp-data-crawler"
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: compdatadb
+      CrawlerSecurityConfiguration: !Ref GlueSecurityConfig
+      Classifiers:
+        - !Ref CSVClassifier
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://compliancedata-${AWS::AccountId}/"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  # ========================================
+  # GLUE CATALOG IMPORT COMPONENTS
+  # ========================================
+
+  # Note: GlueCatalogBucket created by deploy.sh, referenced via parameter
+
+  GlueCatalogImportRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: DLQAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt LambdaDLQ.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt SQSKMSKey.Arn
+        - PolicyName: GlueCatalogImportPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:CreateDatabase
+                  - glue:CreateTable
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:UpdateDatabase
+                  - glue:UpdateTable
+                Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/*"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/*/*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${GlueCatalogBucketName}"
+                  - !Sub "arn:aws:s3:::${GlueCatalogBucketName}/*"
+
+  GlueDatabaseCreateFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}GlueDatabaseCreate"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt GlueCatalogImportRole.Arn
+      Timeout: 300
+      ReservedConcurrentExecutions: 5
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import zipfile
+          import os
+          import cfnresponse
+          import traceback
+          
+          def handler(event, context):
+              databases_created = 0
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  s3 = boto3.client('s3')
+                  glue = boto3.client('glue')
+                  bucket = event['ResourceProperties']['Bucket']
+                  key = event['ResourceProperties']['Key']
+                  print(f"Downloading {key} from {bucket}")
+                  s3.download_file(bucket, key, '/tmp/catalog.zip')
+                  with zipfile.ZipFile('/tmp/catalog.zip', 'r') as zipf:
+                      zipf.extractall('/tmp/glue_import')
+                  for file in os.listdir('/tmp/glue_import'):
+                      if file.endswith('_database.json'):
+                          with open(f'/tmp/glue_import/{file}', 'r') as f:
+                              db_info = json.load(f)
+                          try:
+                              glue.create_database(DatabaseInput={'Name': db_info['Name'], 'Description': db_info.get('Description', ''), 'Parameters': db_info.get('Parameters', {})})
+                              databases_created += 1
+                              print(f"✓ Created database: {db_info['Name']}")
+                          except glue.exceptions.AlreadyExistsException:
+                              print(f"Database {db_info['Name']} already exists")
+                  print(f"Created {databases_created} databases")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': f'{databases_created} databases created'})
+              except Exception as e:
+                  print(f"Error: {str(e)}\n{traceback.format_exc()}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+  
+  GlueViewImportFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}GlueViewImport"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt GlueCatalogImportRole.Arn
+      Timeout: 900
+      ReservedConcurrentExecutions: 5
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import zipfile
+          import os
+          import traceback
+          
+          def clean_view_input(view, target_account_id, source_account_id):
+              import base64
+              readonly_fields = ['DatabaseName', 'CreateTime', 'UpdateTime', 'CreatedBy', 'IsRegisteredWithLakeFormation', 'CatalogId', 'VersionId', 'FederatedTable', 'IsMultiDialectView']
+              view_input = {k: v for k, v in view.items() if k not in readonly_fields}
+              if 'StorageDescriptor' in view_input and view_input['StorageDescriptor']:
+                  view_input['StorageDescriptor'].pop('SchemaReference', None)
+              if 'ViewOriginalText' in view_input:
+                  view_text = view_input['ViewOriginalText']
+                  if 'Presto View:' in view_text:
+                      try:
+                          encoded_part = view_text.split('Presto View: ')[1].split(' */')[0]
+                          decoded = base64.b64decode(encoded_part).decode('utf-8')
+                          decoded = decoded.replace(source_account_id, target_account_id)
+                          encoded = base64.b64encode(decoded.encode('utf-8')).decode('utf-8')
+                          view_input['ViewOriginalText'] = f'/* Presto View: {encoded} */'
+                      except:
+                          view_input['ViewOriginalText'] = view_text.replace(source_account_id, target_account_id)
+                  else:
+                      view_input['ViewOriginalText'] = view_text.replace(source_account_id, target_account_id)
+              if 'ViewExpandedText' in view_input:
+                  view_input['ViewExpandedText'] = view_input['ViewExpandedText'].replace(source_account_id, target_account_id)
+              return view_input
+          
+          def handler(event, context):
+              views_created = 0
+              try:
+                  s3 = boto3.client('s3')
+                  glue = boto3.client('glue')
+                  sts = boto3.client('sts')
+                  target_account_id = sts.get_caller_identity()['Account']
+                  source_account_id = event.get('source_account_id', '049813842017')
+                  bucket = event['bucket']
+                  key = event['key']
+                  print(f"Downloading {key} from {bucket}")
+                  print(f"Replacing account ID {source_account_id} with {target_account_id}")
+                  s3.download_file(bucket, key, '/tmp/catalog.zip')
+                  with zipfile.ZipFile('/tmp/catalog.zip', 'r') as zipf:
+                      zipf.extractall('/tmp/glue_import')
+                  for file in os.listdir('/tmp/glue_import'):
+                      if file.endswith('_views.json'):
+                          db_name = file.replace('_views.json', '')
+                          print(f"Processing views for database: {db_name}")
+                          
+                          # Ensure database exists before creating views
+                          try:
+                              glue.get_database(Name=db_name)
+                              print(f"✓ Database {db_name} already exists")
+                          except glue.exceptions.EntityNotFoundException:
+                              print(f"Creating database {db_name}")
+                              try:
+                                  glue.create_database(
+                                      DatabaseInput={
+                                          'Name': db_name,
+                                          'Description': f'Auto-created database for {db_name} views'
+                                      }
+                                  )
+                                  print(f"✓ Database {db_name} created successfully")
+                              except glue.exceptions.AlreadyExistsException:
+                                  print(f"Database {db_name} already exists (race condition)")
+                          except Exception as e:
+                              print(f"Error checking/creating database {db_name}: {str(e)}")
+                              continue
+                          
+                          with open(f'/tmp/glue_import/{file}', 'r') as f:
+                              views = json.load(f)
+                          print(f"Found {len(views)} views")
+                          for view in views:
+                              view_name = view.get('Name', 'unknown')
+                              try:
+                                  view_input = clean_view_input(view, target_account_id, source_account_id)
+                                  glue.create_table(DatabaseName=db_name, TableInput=view_input)
+                                  views_created += 1
+                                  print(f"✓ Created view: {view_name}")
+                              except glue.exceptions.AlreadyExistsException:
+                                  glue.update_table(DatabaseName=db_name, TableInput=view_input)
+                                  print(f"✓ Updated view: {view_name}")
+                  print(f"Imported {views_created} views")
+                  return {'statusCode': 200, 'body': f'{views_created} views imported'}
+              except Exception as e:
+                  print(f"Error: {str(e)}\n{traceback.format_exc()}")
+                  return {'statusCode': 500, 'body': str(e)}
+
+  TriggerGlueDatabaseCreate:
+    Type: Custom::GlueDatabaseCreate
+    Properties:
+      ServiceToken: !GetAtt GlueDatabaseCreateFunction.Arn
+      Bucket: !Ref GlueCatalogBucketName
+      Key: "glue_catalog_export.zip"
+
+  # Lambda Execution Role (for WebSocket Lambda)
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: DLQAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt LambdaDLQ.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt SQSKMSKey.Arn
+        - PolicyName: DynamoDBKMSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource: !GetAtt DynamoDBKMSKey.Arn
+        - PolicyName: WebSocketDynamoDBKMSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt DynamoDBKMSKey.Arn
+        - PolicyName: BedrockAgentcoreAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeAgentRuntime
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:agent-runtime/*"
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/*"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt ConnectionsTable.Arn
+              - Effect: Allow
+                Action:
+                  - execute-api:ManageConnections
+                Resource: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: 
+                  - 'arn:aws:s3:::spa-code-interpreter-*/*'
+                  - 'arn:aws:s3:::spa-code-interpreter-*'
+
+  # WebSocket Lambda Function
+  WebSocketLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}WebSocketLambda"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      ReservedConcurrentExecutions: 5
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          AGENT_RUNTIME_ARN: 'PLACEHOLDER_WILL_BE_UPDATED_BY_DEPLOY_SCRIPT'
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+          VISUALIZATION_BUCKET: !Sub 'spa-code-interpreter-${AWS::AccountId}'
+      KmsKeyArn: !GetAtt SQSKMSKey.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import time
+          import re
+          
+          def lambda_handler(event, context):
+              route_key = event.get('requestContext', {}).get('routeKey')
+              connection_id = event.get('requestContext', {}).get('connectionId')
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table(os.environ['CONNECTIONS_TABLE'])
+              if route_key == '$connect':
+                  table.put_item(Item={'connectionId': connection_id, 'ttl': int(time.time()) + 3600})
+                  return {'statusCode': 200}
+              elif route_key == '$disconnect':
+                  table.delete_item(Key={'connectionId': connection_id})
+                  return {'statusCode': 200}
+              elif route_key == '$default':
+                  try:
+                      body = json.loads(event.get('body', '{}'))
+                      if body.get('action') == 'ping':
+                          api_gateway = boto3.client('apigatewaymanagementapi', endpoint_url=f"https://{event['requestContext']['domainName']}/{event['requestContext']['stage']}")
+                          api_gateway.post_to_connection(ConnectionId=connection_id, Data=json.dumps({'action': 'pong'}))
+                          return {'statusCode': 200}
+                      user_message = body.get('message')
+                      user_id = body.get('userId', 'anonymous')
+                      bearer_token = body.get('bearerToken')
+                      if not user_message:
+                          return {'statusCode': 400}
+                      if bearer_token:
+                          from botocore import UNSIGNED
+                          from botocore.config import Config
+                          client = boto3.client('bedrock-agentcore', region_name='us-east-1', config=Config(signature_version=UNSIGNED))
+                          def add_auth_header(request, **kwargs):
+                              request.headers['Authorization'] = f'Bearer {bearer_token}'
+                          client.meta.events.register_first('before-sign', add_auth_header)
+                      else:
+                          client = boto3.client('bedrock-agentcore', region_name='us-east-1')
+                      payload = json.dumps({"prompt": user_message, "user_id": user_id, "showCode": True})
+                      session_id = f"spa-persistent-{user_id}".ljust(33, '-')
+                      api_gateway = boto3.client('apigatewaymanagementapi', endpoint_url=f"https://{event['requestContext']['domainName']}/{event['requestContext']['stage']}")
+                      response = client.invoke_agent_runtime(agentRuntimeArn=os.environ['AGENT_RUNTIME_ARN'], runtimeSessionId=session_id, payload=payload, qualifier='DEFAULT')
+                      accumulated_response = ""
+                      s3_client = boto3.client('s3')
+                      for line in response['response'].iter_lines():
+                          if line:
+                              try:
+                                  line_str = line.decode('utf-8')
+                                  if line_str.startswith('data: '):
+                                      data_str = line_str[6:]
+                                      event_data = json.loads(data_str)
+                                  else:
+                                      event_data = json.loads(line_str)
+                                  if not isinstance(event_data, dict):
+                                      continue
+                                  chunk_text = ''
+                                  if 'event' in event_data and 'contentBlockDelta' in event_data['event']:
+                                      delta = event_data['event']['contentBlockDelta']['delta']
+                                      chunk_text = delta.get('text', '')
+                                  if chunk_text:
+                                      accumulated_response += chunk_text
+                                      processed_chunk = chunk_text
+                                      s3_pattern = r's3://([^/\s]+)/(.+?)(?=\s|$|\[)'
+                                      s3_matches = re.findall(s3_pattern, processed_chunk)
+                                      if s3_matches:
+                                          for bucket, key in s3_matches:
+                                              try:
+                                                  presigned_url = s3_client.generate_presigned_url('get_object', Params={'Bucket': bucket, 'Key': key}, ExpiresIn=3600)
+                                                  processed_chunk = processed_chunk.replace(f's3://{bucket}/{key}', presigned_url)
+                                              except Exception as e:
+                                                  print(f'Error generating presigned URL: {e}')
+                                      try:
+                                          api_gateway.post_to_connection(ConnectionId=connection_id, Data=json.dumps({'type': 'chunk', 'chunk': processed_chunk, 'userId': user_id}))
+                                      except Exception as e:
+                                          print(f'Error sending chunk: {e}')
+                              except json.JSONDecodeError as e:
+                                  print(f'JSON decode error: {e}')
+                              except Exception as e:
+                                  print(f'Error processing line: {e}')
+                      s3_pattern = r's3://([^/\s]+)/(.+?)(?=\s|$|\[)'
+                      s3_matches = re.findall(s3_pattern, accumulated_response)
+                      final_response = accumulated_response
+                      if s3_matches:
+                          for bucket, key in s3_matches:
+                              try:
+                                  presigned_url = s3_client.generate_presigned_url('get_object', Params={'Bucket': bucket, 'Key': key}, ExpiresIn=3600)
+                                  final_response = final_response.replace(f's3://{bucket}/{key}', presigned_url)
+                              except Exception as e:
+                                  print(f'Error generating presigned URL: {e}')
+                      try:
+                          api_gateway.post_to_connection(ConnectionId=connection_id, Data=json.dumps({'type': 'complete', 'response': final_response, 'userId': user_id}))
+                      except Exception as e:
+                          print(f'Error sending completion: {e}')
+                      return {'statusCode': 200}
+                  except Exception as e:
+                      print(f'ERROR: {str(e)}')
+                      try:
+                          api_gateway = boto3.client('apigatewaymanagementapi', endpoint_url=f"https://{event['requestContext']['domainName']}/{event['requestContext']['stage']}")
+                          api_gateway.post_to_connection(ConnectionId=connection_id, Data=json.dumps({'error': str(e)}))
+                      except:
+                          pass
+                      return {'statusCode': 500}
+              return {'statusCode': 404}
+
+  # WebSocket API
+  WebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${ResourcePrefix}WebSocketApi"
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: "$request.body.action"
+
+  # Cognito Authorizer for WebSocket
+  WebSocketAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      Name: CognitoAuthorizer
+      ApiId: !Ref WebSocketApi
+      AuthorizerType: REQUEST
+      AuthorizerUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizerLambda.Arn}/invocations"
+      IdentitySource:
+        - route.request.querystring.token
+
+  # Lambda Layer for python-jose
+  JoseLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub "${ResourcePrefix}PythonJoseLayer"
+      Description: Python-jose and dependencies for JWT validation
+      Content:
+        S3Bucket: !Ref LayerBucketName
+        S3Key: !Ref LayerS3Key
+      CompatibleRuntimes:
+        - python3.12
+
+  # Authorizer Lambda
+  AuthorizerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}WebSocketAuthorizer"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      ReservedConcurrentExecutions: 5
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Layers:
+        - !Ref JoseLayer
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPool
+          CLIENT_ID: !Ref UserPoolClient
+      KmsKeyArn: !GetAtt SQSKMSKey.Arn
+      Code:
+        ZipFile: |
+          import json
+          import os
+          from jose import jwt
+          import urllib.request
+          
+          def lambda_handler(event, context):
+              token = event.get('queryStringParameters', {}).get('token')
+              if not token:
+                  return generate_policy('user', 'Deny', event['methodArn'])
+              try:
+                  region = os.environ['AWS_REGION']
+                  user_pool_id = os.environ['USER_POOL_ID']
+                  keys_url = f'https://cognito-idp.{region}.amazonaws.com/{user_pool_id}/.well-known/jwks.json'
+                  with urllib.request.urlopen(keys_url) as response:
+                      keys = json.loads(response.read())['keys']
+                  claims = jwt.decode(token, keys, algorithms=['RS256'], audience=os.environ['CLIENT_ID'], options={'verify_signature': True})
+                  return generate_policy(claims['sub'], 'Allow', event['methodArn'], claims)
+              except Exception as e:
+                  print(f'Auth error: {e}')
+                  return generate_policy('user', 'Deny', event['methodArn'])
+          
+          def generate_policy(principal_id, effect, resource, context=None):
+              policy = {'principalId': principal_id, 'policyDocument': {'Version': '2012-10-17', 'Statement': [{'Action': 'execute-api:Invoke', 'Effect': effect, 'Resource': resource}]}}
+              if context:
+                  policy['context'] = {'username': context.get('cognito:username', '')}
+              return policy
+
+  # Lambda Permission for Authorizer
+  AuthorizerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuthorizerLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/authorizers/${WebSocketAuthorizer}"
+
+  # Connect Route
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $connect
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref WebSocketAuthorizer
+      Target: !Sub "integrations/${ConnectIntegration}"
+
+  # Disconnect Route
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $disconnect
+      Target: !Sub "integrations/${DisconnectIntegration}"
+
+  # Default Route
+  DefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $default
+      Target: !Sub "integrations/${DefaultIntegration}"
+
+  # Connect Integration
+  ConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketLambda.Arn}/invocations"
+
+  # Disconnect Integration
+  DisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketLambda.Arn}/invocations"
+
+  # Default Integration
+  DefaultIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketLambda.Arn}/invocations"
+
+  # WebSocket Deployment
+  WebSocketDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+      - ConnectRoute
+      - DisconnectRoute
+      - DefaultRoute
+    Properties:
+      ApiId: !Ref WebSocketApi
+
+  # KMS Key for CloudWatch Logs
+  CloudWatchLogsKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for CloudWatch Logs encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:CreateGrant'
+              - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+  # IAM Role for API Gateway CloudWatch Logging
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  # CloudWatch Log Group for API Gateway
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${ResourcePrefix}-websocket"
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt CloudWatchLogsKMSKey.Arn
+
+  # API Gateway Account Settings (required for logging)
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    DependsOn: ApiGatewayCloudWatchRole
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  # WebSocket Stage
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    DependsOn: ApiGatewayAccount
+    Properties:
+      ApiId: !Ref WebSocketApi
+      DeploymentId: !Ref WebSocketDeployment
+      StageName: prod
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+        Format: '$context.requestId $context.routeKey $context.status'
+
+  # Lambda Permissions for WebSocket
+  WebSocketLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebSocketLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/*"
+
+Outputs:
+  BucketName:
+    Description: S3 Bucket Name
+    Value: !Ref WebsiteBucket
+  CloudFrontURL:
+    Description: CloudFront Distribution URL
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+  DistributionId:
+    Description: CloudFront Distribution ID
+    Value: !Ref CloudFrontDistribution
+  WebSocketUrl:
+    Description: WebSocket API URL
+    Value: !Sub "wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID for Agent Authentication
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub "${ResourcePrefix}-UserPoolId"
+  CognitoClientId:
+    Description: Cognito App Client ID for Agent Authentication
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub "${ResourcePrefix}-ClientId"
+  CognitoDiscoveryUrl:
+    Description: Cognito OIDC Discovery URL for Agent Authentication
+    Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/openid-configuration"
+    Export:
+      Name: !Sub "${ResourcePrefix}-DiscoveryUrl"
+  SupplierKBRoleArn:
+    Description: ARN of the Supplier Knowledge Base Role
+    Value: !GetAtt SupplierKBRole.Arn
+  OpenSearchCollectionArn:
+    Description: ARN of the OpenSearch Collection
+    Value: !GetAtt OpenSearchCollection.Arn
+  SupplierBucketArn:
+    Description: ARN of the Supplier Bucket
+    Value: !Sub "arn:aws:s3:::${KnowledgeBaseBucketName}"
+  SupplierKnowledgeBaseId:
+    Description: ID of the Supplier Knowledge Base
+    Value: !Ref SupplierKnowledgeBase
+  SupplierDataSourceId:
+    Description: ID of the Supplier Data Source
+    Value: !Ref SupplierDataSource
+  GlueCatalogBucketName:
+    Description: S3 Bucket for Glue Catalog Export
+    Value: !Ref GlueCatalogBucketName
+  SAPSecretName:
+    Description: Secrets Manager Secret Name for SAP Credentials
+    Value: !Ref SAPSecretName

@@ -53,7 +53,7 @@ RFQ Assistant is a comprehensive multi-agent system that helps procurement teams
 ### 1. Clone and Setup
 
 ```bash
-cd RFQAssistant
+cd sample-rfq-agent-strands-multi-agent
 ```
 
 ### 2. Deploy the System

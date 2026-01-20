@@ -11,15 +11,17 @@ RFQ Assistant is a comprehensive multi-agent system that helps procurement teams
 ## Features
 
 ### 🤖 Intelligent Agent Capabilities
-- **RFQ Creation**: Automated Request for Quotation generation with SAP integration
+- **RFQ Creation**: Automated Request for Quotation generation with SAP integration via Bedrock AgentCore Gateway
 - **Supplier Performance Analysis**: Financial metrics, quality scores, and delivery performance
 - **Compliance Checking**: REACH, ROHS, CMRT, and RBA compliance verification
 - **Data Visualization**: Dynamic chart generation with Python code interpreter
 - **Knowledge Base Integration**: Schema and table structure queries via Bedrock Knowledge Base
 - **Conversational Memory**: Persistent context across sessions per user
+- **MCP Integration**: Model Context Protocol for external tool integration via Gateway
 
 ### 🔐 Security & Authentication
 - **Cognito Authentication**: JWT-based user authentication with Amazon Cognito
+- **Gateway OAuth2**: Separate Cognito User Pool for Gateway JWT authentication
 - **IAM Role-Based Access**: Fine-grained permissions for AWS services
 - **WebSocket Security**: Secure real-time communication with API Gateway
 - **WAF Protection**: Rate limiting and common attack prevention
@@ -28,7 +30,8 @@ RFQ Assistant is a comprehensive multi-agent system that helps procurement teams
 - **Amazon Athena**: SQL queries on SAP and compliance data
 - **AWS Glue**: Automated data cataloging and schema management
 - **S3 Data Lakes**: Scalable storage for SAP, compliance, and knowledge base data
-- **SAP Integration**: Direct RFQ creation in SAP systems (optional)
+- **SAP Integration**: Direct RFQ creation in SAP systems via Lambda function exposed through Gateway
+- **Bedrock AgentCore Gateway**: MCP-based tool integration for external system connectivity
 
 ### 🎨 Modern Frontend
 - **React SPA**: Responsive single-page application
@@ -168,9 +171,12 @@ The deployment script automatically creates:
 ### Agent (Bedrock AgentCore)
 - ✅ Strands-based multi-agent system
 - ✅ Persistent memory per user
-- ✅ 8 specialized tools (RFQ, compliance, financial, quality, etc.)
+- ✅ 7 built-in tools (compliance, financial, quality, visualization, etc.)
+- ✅ MCP tools loaded from Gateway (RFQ creation)
+- ✅ Bedrock AgentCore Gateway with CUSTOM_JWT authorizer
+- ✅ Lambda function for SAP RFQ creation
 - ✅ Code interpreter for visualizations
-- ✅ Cognito JWT authentication
+- ✅ OAuth2 client credentials flow for Gateway authentication
 
 ### Data
 - ✅ Sample SAP data (purchase orders, vendors, materials)
@@ -340,9 +346,10 @@ RFQAssistant/
 - **Frontend**: React 18, AWS Amplify UI, WebSocket
 - **Backend**: AWS Lambda (Python 3.12), API Gateway WebSocket
 - **Agent**: Strands Agents SDK, Bedrock AgentCore Runtime
+- **Tool Integration**: Model Context Protocol (MCP), Bedrock AgentCore Gateway
 - **AI Models**: Claude 3.7 Sonnet, Titan Embeddings v2
 - **Data**: Amazon Athena, AWS Glue, S3, DynamoDB
-- **Auth**: Amazon Cognito, JWT
+- **Auth**: Amazon Cognito (User Pool + Gateway Pool), JWT, OAuth2
 - **Infrastructure**: CloudFormation, CloudFront, WAF
 
 ## Key Components
@@ -354,8 +361,8 @@ RFQAssistant/
 4. **get_supplier_quality_metrics**: Quality scores and ratings
 5. **check_vendor_compliance**: REACH, ROHS, CMRT, RBA status
 6. **validate_rfq_data**: Extract and validate RFQ fields
-7. **create_sap_rfq**: Generate RFQ in SAP or demo mode
-8. **execute_python**: Run Python code for visualizations
+7. **execute_python**: Run Python code for visualizations
+8. **create_rfq** (via MCP Gateway): Generate RFQ in SAP or demo mode through Lambda function
 
 ### Memory System
 - **SPAMemoryHook**: Custom hook for context management

@@ -27,6 +27,10 @@ Parameters:
     Type: String
     Default: SAPDEMOCRED
     Description: Name for SAP credentials secret in Secrets Manager
+  SAPURL:
+    Type: String
+    Default: ""
+    Description: SAP URL for RFQ Gateway Lambda
 
 Resources:
   # VPC Configuration
@@ -440,6 +444,63 @@ Resources:
       ExplicitAuthFlows:
         - ALLOW_USER_SRP_AUTH
         - ALLOW_REFRESH_TOKEN_AUTH
+
+  # Gateway Cognito User Pool (separate for Gateway JWT authentication)
+  GatewayUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${ResourcePrefix}GatewayUserPool"
+      AutoVerifiedAttributes:
+        - email
+      UsernameConfiguration:
+        CaseSensitive: false
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: false
+          RequireLowercase: false
+          RequireNumbers: false
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+
+  # Gateway Cognito User Pool Domain (required for OAuth2 token endpoint)
+  GatewayUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub "rfq-gw-${AWS::AccountId}"
+      UserPoolId: !Ref GatewayUserPool
+
+  # Gateway Cognito User Pool Resource Server
+  GatewayResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref GatewayUserPool
+      Identifier: !Sub "${ResourcePrefix}-gateway-api"
+      Name: !Sub "${ResourcePrefix} Gateway API"
+      Scopes:
+        - ScopeName: "invoke"
+          ScopeDescription: "Invoke Gateway API"
+
+  # Gateway Cognito User Pool Client
+  GatewayUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: GatewayResourceServer
+    Properties:
+      UserPoolId: !Ref GatewayUserPool
+      ClientName: !Sub "${ResourcePrefix}GatewayUserPoolClient"
+      GenerateSecret: true
+      AllowedOAuthFlows:
+        - client_credentials
+      AllowedOAuthScopes:
+        - !Sub "${ResourcePrefix}-gateway-api/invoke"
+      AllowedOAuthFlowsUserPoolClient: true
+      AccessTokenValidity: 1
+      TokenValidityUnits:
+        AccessToken: hours
 
   # KMS Key for DynamoDB Encryption
   DynamoDBKMSKey:
@@ -963,6 +1024,25 @@ Resources:
                   - !Sub "arn:aws:s3:::sapdata-${AWS::AccountId}/*"
                   - !Sub "arn:aws:s3:::compliancedata-${AWS::AccountId}"
                   - !Sub "arn:aws:s3:::compliancedata-${AWS::AccountId}/*"
+        - PolicyName: CloudWatchLogsKMSAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:AssociateKmsKey
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/crawlers-role/*"
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                Resource: !GetAtt CloudWatchLogsKMSKey.Arn
 
   CSVClassifier:
     Type: AWS::Glue::Classifier
@@ -1243,6 +1323,219 @@ Resources:
       ServiceToken: !GetAtt GlueDatabaseCreateFunction.Arn
       Bucket: !Ref GlueCatalogBucketName
       Key: "glue_catalog_export.zip"
+
+  # RFQ Gateway Lambda Role
+  RFQGatewayLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: DLQAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt LambdaDLQ.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt SQSKMSKey.Arn
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref SAPCredentialsSecret
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt SecretsKMSKey.Arn
+
+  # Lambda Layer for requests
+  RequestsLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub "${ResourcePrefix}RequestsLayer"
+      Description: Requests library for Lambda
+      Content:
+        S3Bucket: !Ref LayerBucketName
+        S3Key: "requests-layer.zip"
+      CompatibleRuntimes:
+        - python3.12
+
+  # RFQ Gateway Lambda Function
+  RFQGatewayLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}RFQGatewayLambda"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt RFQGatewayLambdaRole.Arn
+      Timeout: 60
+      ReservedConcurrentExecutions: 5
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Layers:
+        - !Ref RequestsLayer
+      Environment:
+        Variables:
+          SAP_URL: !Ref SAPURL
+          SECRET_NAME: !Ref SAPSecretName
+      KmsKeyArn: !GetAtt SQSKMSKey.Arn
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          import requests
+          import re
+          from datetime import datetime, timedelta
+          
+          def get_sap_credentials():
+              secret_name = os.environ['SECRET_NAME']
+              region = os.environ['AWS_REGION']
+              client = boto3.client('secretsmanager', region_name=region)
+              try:
+                  response = client.get_secret_value(SecretId=secret_name)
+                  secret = json.loads(response['SecretString'])
+                  return secret.get('SAPUSER'), secret.get('SAPPASSWORD')
+              except Exception as e:
+                  print(f"Error retrieving credentials: {e}")
+                  return None, None
+          
+          def create_sap_rfq_internal(material_number, supplier_id, quantity, delivery_date, rfq_name=None):
+              sap_url = os.environ.get('SAP_URL')
+              if not sap_url:
+                  import uuid
+                  rfq_number = f"RFQ-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:8].upper()}"
+                  display_name = rfq_name if rfq_name else f"SPA_RFQ_{material_number}_{datetime.now().strftime('%Y%m%d')}"
+                  return f"RFQ {rfq_number} ({display_name}) created successfully for Material {material_number}, Supplier {supplier_id}, Quantity {quantity}, Delivery {delivery_date}"
+              
+              username, password = get_sap_credentials()
+              if not username or not password:
+                  return "Error: SAP credentials not available"
+              
+              company_code = '1710'
+              purchasing_org = '1710'
+              purchasing_group = '001'
+              plant = '1710'
+              currency = 'USD'
+              endpoint = '/sap/opu/odata/sap/API_RFQ_PROCESS_SRV/A_RequestForQuotation'
+              
+              session = requests.Session()
+              csrf_response = session.get(
+                  f"{sap_url}{endpoint}",
+                  headers={'X-CSRF-Token': 'Fetch', 'Accept': 'application/json'},
+                  auth=(username, password),
+                  timeout=30
+              )
+              
+              if csrf_response.status_code != 200:
+                  return f"Error: Failed to connect to SAP (status {csrf_response.status_code})"
+              
+              csrf_token = csrf_response.headers.get('x-csrf-token')
+              if not csrf_token:
+                  return "Error: Failed to get CSRF token"
+              
+              submission_date = (datetime.now() + timedelta(days=2)).strftime('%Y-%m-%dT00:00:00')
+              timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+              
+              if rfq_name:
+                  clean_name = re.sub(r'[^A-Za-z0-9_\-\s]', '', rfq_name)[:50]
+                  sap_rfq_name = clean_name if clean_name else f"SPA_RFQ_{material_number}_{timestamp}"
+              else:
+                  sap_rfq_name = f"SPA_RFQ_{material_number}_{timestamp}"
+              
+              payload = {
+                  "CompanyCode": company_code,
+                  "PurchasingDocumentCategory": "R",
+                  "PurchasingDocumentType": "RSI",
+                  "PurchasingOrganization": purchasing_org,
+                  "PurchasingGroup": purchasing_group,
+                  "DocumentCurrency": currency,
+                  "RequestForQuotationName": sap_rfq_name,
+                  "QuotationLatestSubmissionDate": submission_date,
+                  "to_RequestForQuotationItem": {
+                      "results": [{
+                          "Material": material_number,
+                          "Plant": plant,
+                          "OrderQuantityUnit": "EA",
+                          "BaseUnit": "EA",
+                          "OrderItemQtyToBaseQtyNmrtr": "1",
+                          "OrderItemQtyToBaseQtyDnmntr": "1",
+                          "ScheduleLineOrderQuantity": quantity,
+                          "ScheduleLineDeliveryDate": f"{delivery_date}T00:00:00"
+                      }]
+                  },
+                  "to_RequestForQuotationBidder": {
+                      "results": [{"Supplier": supplier_id}]
+                  }
+              }
+              
+              response = session.post(
+                  f"{sap_url}{endpoint}",
+                  headers={
+                      'X-CSRF-Token': csrf_token,
+                      'X-Requested-With': 'XMLHttpRequest',
+                      'Accept': 'application/json',
+                      'Content-Type': 'application/json'
+                  },
+                  json=payload,
+                  auth=(username, password),
+                  timeout=60
+              )
+              
+              if response.status_code == 201:
+                  rfq_data = response.json()
+                  rfq_number = rfq_data['d']['RequestForQuotation']
+                  return f"RFQ {rfq_number} ({sap_rfq_name}) created successfully in SAP for Material {material_number}, Supplier {supplier_id}, Quantity {quantity}, Delivery {delivery_date}"
+              else:
+                  error_msg = response.text[:200] if response.text else "Unknown error"
+                  return f"Error: Failed to create RFQ - {error_msg}"
+          
+          def lambda_handler(event, context):
+              try:
+                  print(f"Received event: {json.dumps(event)}")
+                  
+                  # Gateway passes parameters directly at top level
+                  material_number = event.get('material_number')
+                  supplier_id = event.get('supplier_id')
+                  quantity = event.get('quantity')
+                  delivery_date = event.get('delivery_date')
+                  rfq_name = event.get('rfq_name')
+                  
+                  if not all([material_number, supplier_id, quantity, delivery_date]):
+                      return {'output': 'Error: Missing required fields (material_number, supplier_id, quantity, delivery_date)'}
+                  
+                  result = create_sap_rfq_internal(material_number, supplier_id, quantity, delivery_date, rfq_name)
+                  
+                  return {'output': result}
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  import traceback
+                  print(traceback.format_exc())
+                  return {'output': f'Error: {str(e)}'}
 
   # Lambda Execution Role (for WebSocket Lambda)
   LambdaExecutionRole:
@@ -1744,3 +2037,23 @@ Outputs:
   SAPSecretName:
     Description: Secrets Manager Secret Name for SAP Credentials
     Value: !Ref SAPSecretName
+  RFQGatewayLambdaArn:
+    Description: ARN of the RFQ Gateway Lambda Function
+    Value: !GetAtt RFQGatewayLambda.Arn
+    Export:
+      Name: !Sub "${ResourcePrefix}-RFQGatewayLambdaArn"
+  GatewayUserPoolId:
+    Description: Gateway Cognito User Pool ID for JWT Authentication
+    Value: !Ref GatewayUserPool
+    Export:
+      Name: !Sub "${ResourcePrefix}-GatewayUserPoolId"
+  GatewayUserPoolClientId:
+    Description: Gateway Cognito User Pool Client ID for JWT Authentication
+    Value: !Ref GatewayUserPoolClient
+    Export:
+      Name: !Sub "${ResourcePrefix}-GatewayUserPoolClientId"
+  GatewayTokenUrl:
+    Description: Gateway Cognito OAuth2 Token URL
+    Value: !Sub "https://rfq-gw-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/oauth2/token"
+    Export:
+      Name: !Sub "${ResourcePrefix}-GatewayTokenUrl"

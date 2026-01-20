@@ -118,6 +118,12 @@ cd lambda_layer && zip -r ../python-jose-layer.zip python > /dev/null && cd ..
 echo "Uploading Lambda Layer to S3..."
 aws s3 cp python-jose-layer.zip s3://$LAYER_BUCKET/
 
+echo "Creating requests Lambda Layer..."
+mkdir -p requests_layer/python
+pip install requests -t requests_layer/python/ --quiet
+cd requests_layer && zip -r ../requests-layer.zip python > /dev/null && cd ..
+aws s3 cp requests-layer.zip s3://$LAYER_BUCKET/
+
 echo "Creating OpenSearch Lambda Layer..."
 mkdir -p opensearch_layer/python
 pip install opensearch-py requests requests-aws4auth -t opensearch_layer/python/ --quiet
@@ -153,6 +159,7 @@ aws cloudformation deploy \
     KnowledgeBaseBucketName=$KB_BUCKET \
     GlueCatalogBucketName=glue-catalog-${ACCOUNT_ID} \
     SAPSecretName=$SECRET_NAME \
+    SAPURL="$SAP_URL" \
   --capabilities CAPABILITY_IAM
 
 if [ $? -ne 0 ]; then
@@ -265,10 +272,54 @@ else
     echo "[WARNING] Knowledge Base IDs not found (KB_ID: $KB_ID, DS_ID: $DS_ID)"
 fi
 
+echo "Creating Bedrock AgentCore Gateway..."
+GATEWAY_URL=""
+GATEWAY_CLIENT_SECRET=""
+if [ -f "create_gateway.py" ]; then
+    LAMBDA_ARN=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --query 'Stacks[0].Outputs[?OutputKey==`RFQGatewayLambdaArn`].OutputValue' --output text)
+    GATEWAY_USER_POOL_ID=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --query 'Stacks[0].Outputs[?OutputKey==`GatewayUserPoolId`].OutputValue' --output text)
+    GATEWAY_CLIENT_ID=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --query 'Stacks[0].Outputs[?OutputKey==`GatewayUserPoolClientId`].OutputValue' --output text)
+    GATEWAY_TOKEN_URL=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --query 'Stacks[0].Outputs[?OutputKey==`GatewayTokenUrl`].OutputValue' --output text)
+    
+    if [ ! -z "$LAMBDA_ARN" ] && [ ! -z "$GATEWAY_USER_POOL_ID" ] && [ ! -z "$GATEWAY_CLIENT_ID" ]; then
+        echo "RFQ Gateway Lambda ARN: $LAMBDA_ARN"
+        
+        GATEWAY_CLIENT_SECRET=$(aws cognito-idp describe-user-pool-client \
+          --user-pool-id $GATEWAY_USER_POOL_ID \
+          --client-id $GATEWAY_CLIENT_ID \
+          --query "UserPoolClient.ClientSecret" \
+          --output text)
+        
+        if [ ! -z "$GATEWAY_CLIENT_SECRET" ]; then
+            python create_gateway.py $LAMBDA_ARN $GATEWAY_USER_POOL_ID $GATEWAY_CLIENT_ID $REGION
+            
+            if [ $? -eq 0 ] && [ -f "gateway_config.json" ]; then
+                GATEWAY_URL=$(python -c "import json; print(json.load(open('gateway_config.json'))['gateway_url'])")
+                echo "[OK] Gateway created: $GATEWAY_URL"
+            else
+                # Fallback: try to find existing RFQ gateway with CUSTOM_JWT
+                GATEWAY_ID=$(aws bedrock-agentcore-control list-gateways --region $REGION --query "items[?contains(name, 'RFQ') && authorizerType=='CUSTOM_JWT'].gatewayId" --output text | head -1)
+                if [ ! -z "$GATEWAY_ID" ]; then
+                    GATEWAY_URL="https://${GATEWAY_ID}.gateway.bedrock-agentcore.${REGION}.amazonaws.com/mcp"
+                    echo "[OK] Using existing Gateway: $GATEWAY_URL"
+                else
+                    echo "[WARNING] Failed to create Gateway or find existing CUSTOM_JWT gateway"
+                fi
+            fi
+        fi
+    fi
+fi
+
 echo "Deploying Bedrock Agent..."
 if [ -f "deploy_spa_multi_agent_system_v8.py" ]; then
     echo "Installing bedrock_agentcore_starter_toolkit..."
     pip install bedrock_agentcore_starter_toolkit --quiet
+    
+    GATEWAY_ARGS=""
+    if [ ! -z "$GATEWAY_URL" ]; then
+        GATEWAY_ARGS="--gateway-url $GATEWAY_URL --gateway-cognito-client-id $GATEWAY_CLIENT_ID --gateway-cognito-client-secret $GATEWAY_CLIENT_SECRET --gateway-token-url $GATEWAY_TOKEN_URL"
+    fi
+    
     python deploy_spa_multi_agent_system_v8.py \
       --s3-output-bucket s3://$ATHENA_BUCKET/ \
       --knowledge-base-id $KB_ID \
@@ -282,26 +333,20 @@ if [ -f "deploy_spa_multi_agent_system_v8.py" ]; then
       --agent-name $AGENT_NAME \
       --cognito-user-pool-id $USER_POOL_ID \
       --cognito-client-id $USER_POOL_CLIENT_ID \
+      $GATEWAY_ARGS \
       --auto-update-on-conflict
     
     if [ $? -eq 0 ]; then
         echo "[OK] Bedrock Agent deployed successfully"
         
-        # Extract agent ARN from deployment file or list agents
         if [ -f "${AGENT_NAME}_deployment.json" ]; then
             AGENT_RUNTIME_ARN=$(grep -o '"agent_arn": "[^"]*"' ${AGENT_NAME}_deployment.json | cut -d'"' -f4)
         else
-            # Fallback: list agents and find by name
             AGENT_RUNTIME_ARN=$(aws bedrock-agentcore-control list-agent-runtimes --region $REGION --query "agentRuntimes[?contains(agentRuntimeArn, '$AGENT_NAME')].agentRuntimeArn" --output text | head -1)
         fi
         
-        if [ -z "$AGENT_RUNTIME_ARN" ]; then
-            echo "[WARNING] Could not determine agent ARN"
-        else
+        if [ ! -z "$AGENT_RUNTIME_ARN" ]; then
             echo "Agent Runtime ARN: $AGENT_RUNTIME_ARN"
-            
-            # Update WebSocket Lambda with agent ARN
-            echo "Updating WebSocket Lambda with agent ARN..."
             aws lambda update-function-configuration \
               --function-name ${RESOURCE_PREFIX}WebSocketLambda \
               --environment "Variables={AGENT_RUNTIME_ARN=$AGENT_RUNTIME_ARN,CONNECTIONS_TABLE=${RESOURCE_PREFIX}ConnectionsTable,VISUALIZATION_BUCKET=spa-code-interpreter-${ACCOUNT_ID}}" \
@@ -312,7 +357,7 @@ if [ -f "deploy_spa_multi_agent_system_v8.py" ]; then
         echo "[WARNING] Failed to deploy Bedrock Agent"
     fi
 else
-    echo "[WARNING] deploy_spa_multi_agent_system_v8.py not found, skipping agent deployment"
+    echo "[WARNING] deploy_spa_multi_agent_system_v8.py not found"
 fi
 
 echo ""
@@ -325,6 +370,13 @@ echo "Knowledge Base Bucket: s3://$KB_BUCKET"
 echo "Athena Query Bucket: s3://$ATHENA_BUCKET"
 echo "Knowledge Base ID: $KB_ID"
 echo "Agent Name: $AGENT_NAME"
+if [ ! -z "$GATEWAY_URL" ]; then
+    echo ""
+    echo "=== Gateway Configuration ==="
+    echo "Gateway URL: $GATEWAY_URL"
+    echo "Gateway Client ID: $GATEWAY_CLIENT_ID"
+    echo "Gateway Token URL: $GATEWAY_TOKEN_URL"
+fi
 echo ""
 echo "Glue crawlers started. Check status with:"
 echo "  aws glue get-crawler --name $SAP_CRAWLER"

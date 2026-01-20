@@ -16,11 +16,10 @@ echo ""
 echo "1. Deleting Bedrock AgentCore agents..."
 for DEPLOY_FILE in *_deployment.json; do
     if [ -f "$DEPLOY_FILE" ]; then
-        AGENT_ARN=$(jq -r '.agent_arn // empty' "$DEPLOY_FILE" 2>/dev/null)
-        if [ ! -z "$AGENT_ARN" ]; then
-            AGENT_ID=$(echo $AGENT_ARN | rev | cut -d'/' -f1 | rev)
+        AGENT_ID=$(jq -r '.agent_id // empty' "$DEPLOY_FILE" 2>/dev/null)
+        if [ ! -z "$AGENT_ID" ]; then
             echo "  Deleting agent from $DEPLOY_FILE: $AGENT_ID"
-            aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id $AGENT_ARN --region $REGION 2>/dev/null || echo "  Failed to delete $AGENT_ID"
+            aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id $AGENT_ID --region $REGION 2>/dev/null || echo "  Failed to delete $AGENT_ID"
         fi
     fi
 done
@@ -44,9 +43,45 @@ if [ ! -f *_deployment.json 2>/dev/null ]; then
     echo "  No deployment files found"
 fi
 
-# 3. Delete ECR Repositories
+# 3. Delete Bedrock AgentCore Gateways
 echo ""
-echo "3. Deleting ECR repositories..."
+echo "3. Deleting Bedrock AgentCore gateways..."
+
+# Try to get gateway ID from config file first
+if [ -f "gateway_config.json" ]; then
+    GATEWAY_ID=$(python -c "import json; print(json.load(open('gateway_config.json')).get('gateway_id', ''))" 2>/dev/null || echo "")
+    if [ ! -z "$GATEWAY_ID" ]; then
+        echo "  Found gateway in config: $GATEWAY_ID"
+        GATEWAY_IDS="$GATEWAY_ID"
+    fi
+fi
+
+# Fallback: search for RFQ gateways
+if [ -z "$GATEWAY_IDS" ]; then
+    GATEWAY_IDS=$(aws bedrock-agentcore-control list-gateways --region $REGION --query "items[?contains(name, 'RFQ')].gatewayId" --output text 2>/dev/null || echo "")
+fi
+
+if [ ! -z "$GATEWAY_IDS" ]; then
+    for GATEWAY_ID in $GATEWAY_IDS; do
+        echo "  Deleting targets for gateway: $GATEWAY_ID"
+        TARGET_IDS=$(aws bedrock-agentcore-control list-gateway-targets --gateway-identifier $GATEWAY_ID --region $REGION --query "items[].targetId" --output text 2>/dev/null || echo "")
+        if [ ! -z "$TARGET_IDS" ]; then
+            for TARGET_ID in $TARGET_IDS; do
+                echo "    Deleting target: $TARGET_ID"
+                aws bedrock-agentcore-control delete-gateway-target --gateway-identifier $GATEWAY_ID --target-id $TARGET_ID --region $REGION 2>/dev/null || true
+            done
+            sleep 5
+        fi
+        echo "  Deleting gateway: $GATEWAY_ID"
+        aws bedrock-agentcore-control delete-gateway --gateway-identifier $GATEWAY_ID --region $REGION 2>/dev/null || echo "  Failed to delete $GATEWAY_ID"
+    done
+else
+    echo "  No RFQ gateways found"
+fi
+
+# 4. Delete ECR Repositories
+echo ""
+echo "4. Deleting ECR repositories..."
 ECR_REPOS=$(aws ecr describe-repositories --region $REGION --query 'repositories[?contains(repositoryName, `bedrock-agentcore`)].repositoryName' --output text 2>/dev/null || echo "")
 if [ ! -z "$ECR_REPOS" ]; then
     for REPO in $ECR_REPOS; do
@@ -68,10 +103,22 @@ for BUCKET in \
     "athena-query-bucket-${ACCOUNT_ID}" \
     "spa-code-interpreter-${ACCOUNT_ID}" \
     "glue-catalog-${ACCOUNT_ID}" \
-    "react-chat-app-bucket-${ACCOUNT_ID}"; do
+    "react-chat-app-bucket-${ACCOUNT_ID}" \
+    "react-chat-app-bucket-logs-${ACCOUNT_ID}"; do
     if aws s3 ls "s3://$BUCKET" 2>/dev/null; then
         echo "  Emptying bucket: $BUCKET"
-        aws s3 rm "s3://$BUCKET" --recursive 2>/dev/null || echo "  Failed to empty $BUCKET"
+        # Delete all object versions and delete markers
+        aws s3api list-object-versions --bucket "$BUCKET" --output json --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' 2>/dev/null | \
+        jq -r '.Objects[]? | "--key '\''" + .Key + "'\'' --version-id " + .VersionId' | \
+        xargs -I {} aws s3api delete-object --bucket "$BUCKET" {} 2>/dev/null || true
+        
+        aws s3api list-object-versions --bucket "$BUCKET" --output json --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' 2>/dev/null | \
+        jq -r '.Objects[]? | "--key '\''" + .Key + "'\'' --version-id " + .VersionId' | \
+        xargs -I {} aws s3api delete-object --bucket "$BUCKET" {} 2>/dev/null || true
+        
+        # Fallback: delete current objects
+        aws s3 rm "s3://$BUCKET" --recursive 2>/dev/null || true
+        
         echo "  Deleting bucket: $BUCKET"
         aws s3 rb "s3://$BUCKET" 2>/dev/null || echo "  Failed to delete $BUCKET"
     else
@@ -152,6 +199,7 @@ echo ""
 echo "9. Cleaning up local files..."
 rm -f .bedrock_agentcore.yaml
 rm -f *_deployment.json
+rm -f gateway_config.json
 rm -f spa_multi_agent_system_configured.py
 rm -f python-jose-layer.zip
 rm -f opensearch-layer.zip

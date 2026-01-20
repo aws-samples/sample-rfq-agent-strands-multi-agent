@@ -1,5 +1,7 @@
 from strands import Agent, tool
 from strands.models import BedrockModel
+from strands.tools.mcp.mcp_client import MCPClient
+from mcp.client.streamable_http import streamablehttp_client
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from bedrock_agentcore.memory import MemoryClient
 from bedrock_agentcore.memory.integrations.strands.config import AgentCoreMemoryConfig
@@ -36,6 +38,18 @@ MEMORY_CONTEXT_TURNS = int(os.getenv('MEMORY_CONTEXT_TURNS', '10'))
 SPA_MEMORY_ID = os.getenv('SPA_MEMORY_ID')
 SPA_MEMORY_NAME = os.getenv('SPA_MEMORY_NAME')
 CODE_INTERPRETER_BUCKET = os.getenv('CODE_INTERPRETER_BUCKET', 'spa-code-interpreter-output')
+
+# Gateway Configuration - MCP Client with OAuth2
+GATEWAY_URL = os.getenv('GATEWAY_URL')
+GATEWAY_COGNITO_CLIENT_ID = os.getenv('GATEWAY_COGNITO_CLIENT_ID')
+GATEWAY_COGNITO_CLIENT_SECRET = os.getenv('GATEWAY_COGNITO_CLIENT_SECRET')
+GATEWAY_TOKEN_URL = os.getenv('GATEWAY_TOKEN_URL')
+
+# Global MCP client and tools cache
+_mcp_client = None
+_mcp_tools_cache = None
+_access_token_cache = None
+_token_expiry = None
 
 # Setup logging
 log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
@@ -150,6 +164,91 @@ def get_sap_credentials():
         logger.error(f"Error retrieving SAP credentials: {e}")
         return None, None
 
+def get_gateway_access_token():
+    """Get access token from Gateway Cognito using OAuth2 client credentials with caching"""
+    global _access_token_cache, _token_expiry
+    
+    if _access_token_cache and _token_expiry and time.time() < _token_expiry:
+        return _access_token_cache
+    
+    try:
+        if not GATEWAY_TOKEN_URL or not GATEWAY_COGNITO_CLIENT_ID or not GATEWAY_COGNITO_CLIENT_SECRET:
+            logger.error("Gateway OAuth2 credentials not configured")
+            return None
+        
+        response = requests.post(
+            GATEWAY_TOKEN_URL,
+            data=f"grant_type=client_credentials&client_id={GATEWAY_COGNITO_CLIENT_ID}&client_secret={GATEWAY_COGNITO_CLIENT_SECRET}",
+            headers={'Content-Type': 'application/x-www-form-urlencoded'}
+        )
+        response.raise_for_status()
+        token_data = response.json()
+        _access_token_cache = token_data['access_token']
+        _token_expiry = time.time() + (50 * 60)
+        return _access_token_cache
+    except Exception as e:
+        logger.error(f"Failed to get Gateway access token: {e}")
+        return None
+
+def create_streamable_http_transport(mcp_url: str, access_token: str):
+    """Create HTTP transport for MCP client with Bearer token"""
+    return streamablehttp_client(mcp_url, headers={"Authorization": f"Bearer {access_token}"})
+
+def get_mcp_tools():
+    """Get tools from Gateway MCP server - called once at startup"""
+    global _mcp_tools_cache, _mcp_client
+    
+    if _mcp_tools_cache is not None:
+        return _mcp_tools_cache
+    
+    try:
+        if not GATEWAY_URL:
+            logger.warning("Gateway URL not configured - MCP tools unavailable")
+            return []
+        
+        access_token = get_gateway_access_token()
+        if not access_token:
+            logger.warning("Failed to get access token - MCP tools unavailable")
+            return []
+        
+        _mcp_client = MCPClient(lambda: create_streamable_http_transport(GATEWAY_URL, access_token))
+        _mcp_client.__enter__()
+        
+        tools = []
+        pagination_token = None
+        while True:
+            tmp_tools = _mcp_client.list_tools_sync(pagination_token=pagination_token)
+            tools.extend(tmp_tools)
+            if tmp_tools.pagination_token is None:
+                break
+            pagination_token = tmp_tools.pagination_token
+        
+        _mcp_tools_cache = tools
+        logger.info(f"✅ Loaded {len(tools)} MCP tools from Gateway: {[t.tool_name for t in tools]}")
+        return tools
+    except Exception as e:
+        logger.error(f"Failed to get MCP tools: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return []
+
+
+@tool
+def lookup_schema(question: str) -> str:
+    """Ask Bedrock Knowledge Base about available tables/columns."""
+    try:
+        response = bedrock_kb.retrieve(
+            knowledgeBaseId=KNOWLEDGE_BASE_ID,
+            retrievalQuery={"text": question},
+            retrievalConfiguration={"vectorSearchConfiguration": {"numberOfResults": 3}}
+        )
+        docs = response.get("retrievalResults", [])
+        if not docs:
+            return "No schema information found for your query."
+        return "\n".join([d["content"]["text"] for d in docs])
+    except Exception as e:
+        logger.error(f"Schema lookup error: {e}")
+        return f"Error accessing schema information: {str(e)}"
+
 def _extract_rfq_data_from_context(user_input: str, conversation_context: str = "") -> dict:
     """Extract RFQ data from user input and conversation context including RFQ Name."""
     try:
@@ -161,7 +260,7 @@ def _extract_rfq_data_from_context(user_input: str, conversation_context: str = 
             r'material\s+(?:number\s*)?:?\s*([A-Z0-9\-]+)',
             r'for\s+material\s+([A-Z0-9\-]+)',
             r'mat\s*:?\s*([A-Z0-9\-]+)',
-            r'\b([A-Z]{2,4}-[A-Z]{2,4}-[A-Z0-9]{3,6}-[0-9]{2})\b'  # Pattern like MZ-RM-C900-06
+            r'\b([A-Z]{2,4}-[A-Z]{2,4}-[A-Z0-9]{3,6}-[0-9]{2})\b'
         ]
         
         supplier_patterns = [
@@ -169,7 +268,7 @@ def _extract_rfq_data_from_context(user_input: str, conversation_context: str = 
             r'vendor\s+(?:id\s*)?:?\s*([A-Z0-9\-]+)',
             r'to\s+vendor\s+([A-Z0-9\-]+)',
             r'from\s+supplier\s+([A-Z0-9\-]+)',
-            r'\b([A-Z]{3,5}-[A-Z0-9]{3,8})\b'  # Pattern like USSU-VSF01
+            r'\b([A-Z]{3,5}-[A-Z0-9]{3,8})\b'
         ]
         
         quantity_patterns = [
@@ -189,7 +288,6 @@ def _extract_rfq_data_from_context(user_input: str, conversation_context: str = 
             r'on\s+([0-9]{4}-[0-9]{2}-[0-9]{2})'
         ]
         
-        # NEW: RFQ Name patterns
         rfq_name_patterns = [
             r'rfq\s+name\s*:?\s*["\']?([^"\';\n]+)["\']?',
             r'name\s*:?\s*["\']?([^"\';\n]+)["\']?',
@@ -199,41 +297,40 @@ def _extract_rfq_data_from_context(user_input: str, conversation_context: str = 
             r'named?\s*:?\s*["\']?([^"\';\n]+)["\']?'
         ]
         
-        # Extract data using patterns
+        # Extract data
         material_number = None
         for pattern in material_patterns:
             matches = re.findall(pattern, full_text, re.IGNORECASE)
             if matches:
-                material_number = matches[-1]  # Take the last match
+                material_number = matches[-1]
                 break
         
         supplier_id = None
         for pattern in supplier_patterns:
             matches = re.findall(pattern, full_text, re.IGNORECASE)
             if matches:
-                supplier_id = matches[-1]  # Take the last match
+                supplier_id = matches[-1]
                 break
                 
         quantity = None
         for pattern in quantity_patterns:
             matches = re.findall(pattern, full_text, re.IGNORECASE)
             if matches:
-                quantity = matches[-1]  # Take the last match
+                quantity = matches[-1]
                 break
                 
         delivery_date = None
         for pattern in delivery_patterns:
             matches = re.findall(pattern, full_text, re.IGNORECASE)
             if matches:
-                delivery_date = matches[-1]  # Take the last match
+                delivery_date = matches[-1]
                 break
         
-        # NEW: Extract RFQ Name
         rfq_name = None
         for pattern in rfq_name_patterns:
             matches = re.findall(pattern, full_text, re.IGNORECASE)
             if matches:
-                rfq_name = matches[-1].strip()  # Take the last match and clean it
+                rfq_name = matches[-1].strip()
                 break
         
         return {
@@ -241,7 +338,7 @@ def _extract_rfq_data_from_context(user_input: str, conversation_context: str = 
             "supplier_id": supplier_id,
             "quantity": quantity,
             "delivery_date": delivery_date,
-            "rfq_name": rfq_name  # NEW field
+            "rfq_name": rfq_name
         }
         
     except Exception as e:
@@ -251,170 +348,8 @@ def _extract_rfq_data_from_context(user_input: str, conversation_context: str = 
             "supplier_id": None, 
             "quantity": None, 
             "delivery_date": None,
-            "rfq_name": None  # NEW field
+            "rfq_name": None
         }
-
-def _create_sap_rfq_internal(material_number: str, supplier_id: str, quantity: str, delivery_date: str, rfq_name: str = None) -> str:
-    """Create RFQ in SAP system with full integration including RFQ Name."""
-
-    if not SAP_URL or not SECRET_NAME:
-        # Generate realistic RFQ number for demo/testing
-        rfq_number = f"RFQ-{datetime.now().strftime('%Y%m%d')}-{str(uuid.uuid4())[:8].upper()}"
-
-        # Use provided name or generate default
-        display_name = rfq_name if rfq_name else f"SPA_RFQ_{material_number}_{datetime.now().strftime('%Y%m%d')}"
-
-        return f"""✅ RFQ Created Successfully!
-
-RFQ Number: {rfq_number}
-RFQ Name: {display_name}
-Material: {material_number}
-Supplier: {supplier_id}
-Quantity: {quantity}
-Delivery Date: {delivery_date}
-Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-Status: Pending Supplier Response
-
-The RFQ has been sent to the supplier for pricing confirmation."""
-
-    try:
-        username, password = get_sap_credentials()
-        if not username or not password:
-            return "❌ SAP credentials are not available."
-
-        # SAP configuration
-        company_code = os.getenv('SAP_COMPANY_CODE', '1710')
-        purchasing_org = os.getenv('SAP_PURCHASING_ORG', '1710')
-        purchasing_group = os.getenv('SAP_PURCHASING_GROUP', '001')
-        plant = os.getenv('SAP_PLANT', '1710')
-        currency = os.getenv('SAP_CURRENCY', 'USD')
-
-        endpoint = '/sap/opu/odata/sap/API_RFQ_PROCESS_SRV/A_RequestForQuotation'
-
-        # Get CSRF token
-        session = requests.Session()
-        # checkov:skip=CKV_SECRET_6: 'Fetch' is a standard SAP API header value, not a secret
-        csrf_response = session.get(
-            f"{SAP_URL}{endpoint}",
-            headers={'X-CSRF-Token': 'Fetch', 'Accept': 'application/json'},  # nosec B105 - Standard SAP header
-            auth=(username, password),
-            timeout=30
-        )
-
-        if csrf_response.status_code != 200:
-            return f"❌ Failed to connect to SAP system. Status: {csrf_response.status_code}"
-
-        csrf_token = csrf_response.headers.get('x-csrf-token')
-        if not csrf_token:
-            return "❌ Failed to get CSRF token from SAP system"
-
-        # Calculate submission date (2 days from now)
-        submission_date = (datetime.now() + timedelta(days=2)).strftime('%Y-%m-%dT00:00:00')
-        timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-
-        # NEW: Generate RFQ name - use provided name or create default
-        if rfq_name:
-            # Clean the provided name for SAP (remove special characters, limit length)
-            clean_name = re.sub(r'[^A-Za-z0-9_\-\s]', '', rfq_name)[:50]  # Limit to 50 chars
-            sap_rfq_name = clean_name if clean_name else f"SPA_RFQ_{material_number}_{timestamp}"
-        else:
-            sap_rfq_name = f"SPA_RFQ_{material_number}_{timestamp}"
-
-        # Prepare RFQ payload
-        payload = {
-            "CompanyCode": company_code,
-            "PurchasingDocumentCategory": "R",
-            "PurchasingDocumentType": "RSI",
-            "PurchasingOrganization": purchasing_org,
-            "PurchasingGroup": purchasing_group,
-            "DocumentCurrency": currency,
-            "RequestForQuotationName": sap_rfq_name,  # NEW: Use actual RFQ name
-            "QuotationLatestSubmissionDate": submission_date,
-            "to_RequestForQuotationItem": {
-                "results": [{
-                    "Material": material_number,
-                    "Plant": plant,
-                    "OrderQuantityUnit": "EA",
-                    "BaseUnit": "EA",
-                    "OrderItemQtyToBaseQtyNmrtr": "1",
-                    "OrderItemQtyToBaseQtyDnmntr": "1",
-                    "ScheduleLineOrderQuantity": quantity,
-                    "ScheduleLineDeliveryDate": f"{delivery_date}T00:00:00"
-                }]
-            },
-            "to_RequestForQuotationBidder": {
-                "results": [{"Supplier": supplier_id}]
-            }
-        }
-
-        # Create RFQ
-        response = session.post(
-            f"{SAP_URL}{endpoint}",
-            headers={
-                'X-CSRF-Token': csrf_token,
-                'X-Requested-With': 'XMLHttpRequest',
-                'Accept': 'application/json',
-                'Content-Type': 'application/json'
-            },
-            json=payload,
-            auth=(username, password),
-            timeout=60
-        )
-
-        if response.status_code == 201:
-            rfq_data = response.json()
-            rfq_number = rfq_data['d']['RequestForQuotation']
-            logger.info(f"RFQ {rfq_number} created successfully with name: {sap_rfq_name}")
-
-            return f"""✅ RFQ Created Successfully in SAP!
-
-RFQ Number: {rfq_number}
-RFQ Name: {sap_rfq_name}
-Material: {material_number}
-Supplier: {supplier_id}
-Quantity: {quantity}
-Delivery Date: {delivery_date}
-Submission Deadline: {submission_date.split('T')[0]}
-Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-Status: Active
-
-The RFQ is now available in SAP for supplier response."""
-        else:
-            error_details = response.json() if response.text else {"message": "Unknown error"}
-            error_message = "Unknown error"
-            try:
-                if 'error' in error_details:
-                    error_message = error_details['error'].get('message', {}).get('value', 'SAP API error')
-                else:
-                    error_message = str(error_details)
-            except:
-                error_message = response.text or "SAP API error"
-
-            logger.error(f"Failed to create RFQ: {error_message}")
-            return f"❌ Failed to create RFQ: {error_message}"
-
-    except Exception as e:
-        logger.error(f"Error creating RFQ: {e}")
-        return f"❌ Error creating RFQ: {str(e)}"
-
-
-# FIXED TOOLS - No vendor validation, accept all formats
-@tool
-def lookup_schema(question: str) -> str:
-    """Ask Bedrock Knowledge Base about available tables/columns."""
-    try:
-        response = bedrock_kb.retrieve(
-            knowledgeBaseId=KNOWLEDGE_BASE_ID,
-            retrievalQuery={"text": question},
-            retrievalConfiguration={"vectorSearchConfiguration": {"numberOfResults": 3}}
-        )
-        docs = response.get("retrievalResults", [])
-        if not docs:
-            return "No schema information found for your query."
-        return "\n".join([d["content"]["text"] for d in docs])
-    except Exception as e:
-        logger.error(f"Schema lookup error: {e}")
-        return f"Error accessing schema information: {str(e)}"
 
 @tool
 def query_athena(query: str) -> str:
@@ -693,108 +628,15 @@ except Exception as e:
         logger.error(traceback.format_exc())
         return f"Error: {str(e)}"
 
-@tool
-def create_sap_rfq(user_input: str) -> str:
-    """You are an RFQ creation assistant. When users want to create an RFQ, ask for all required information at once using this format: Please provide the following details for RFQ creation: - Material Number: (required) - Supplier ID: (required) - Quantity: (required) - Delivery Date: (required, format: YYYY-MM-DD) - RFQ Name: (optional) Example of complete information: Material Number: MZ-RM-M500-04 Supplier ID: USSU-VSF08 Quantity: 10 Delivery Date: 2025-05-05 RFQ Name: Test RFQ If any required information is missing, list only the missing items needed to complete the RFQ. For incomplete requests like "Create RFQ for MZ-RM-M500-04", respond with: "To create the RFQ, I still need: - Supplier ID - Quantity - Delivery Date - RFQ Name (optional) Please provide these details."""
-    
-    try:
-        logger.info(f"Processing RFQ request: {user_input}")
-        
-        # Extract RFQ data from input and context
-        rfq_data = _extract_rfq_data_from_context(user_input, "")  # Context would come from memory
-        
-        material_number = rfq_data["material_number"]
-        supplier_id = rfq_data["supplier_id"]
-        quantity = rfq_data["quantity"]
-        delivery_date = rfq_data["delivery_date"]
-        rfq_name = rfq_data["rfq_name"]  # NEW: Optional field
-        
-        # Check what's missing (RFQ Name is optional)
-        missing_fields = []
-        if not material_number:
-            missing_fields.append("Material Number")
-        if not supplier_id:
-            missing_fields.append("Supplier ID")
-        if not quantity:
-            missing_fields.append("Quantity")
-        if not delivery_date:
-            missing_fields.append("Delivery Date (YYYY-MM-DD)")
-        
-        if missing_fields:
-            # Show what we have and ask for what's missing
-            collected_info = []
-            if material_number:
-                collected_info.append(f"✅ Material Number: {material_number}")
-            if supplier_id:
-                collected_info.append(f"✅ Supplier ID: {supplier_id}")
-            if quantity:
-                collected_info.append(f"✅ Quantity: {quantity}")
-            if delivery_date:
-                collected_info.append(f"✅ Delivery Date: {delivery_date}")
-            if rfq_name:
-                collected_info.append(f"✅ RFQ Name: {rfq_name}")
-            
-            collected_text = "\n".join(collected_info) if collected_info else ""
-            
-            if len(missing_fields) == 1:
-                # Only one field missing - ask specifically for it
-                missing_field = missing_fields[0]
-                
-                if collected_text:
-                    return f"""I have the following information for the RFQ:
 
-{collected_text}
+# Load MCP tools at startup - AFTER all @tool functions are defined
+mcp_tools = get_mcp_tools()
+if mcp_tools:
+    logger.info(f"🔧 MCP tools ready: {[t.tool_name for t in mcp_tools]}")
+else:
+    logger.warning("⚠️ No MCP tools loaded - Gateway features unavailable")
 
-I just need the {missing_field} to create the RFQ. Please provide the {missing_field}.
 
-(RFQ Name is optional - I can generate one if not provided)"""
-                else:
-                    return f"To create the RFQ, I need the {missing_field}. Please provide it.\n\n(RFQ Name is optional)"
-            else:
-                # Multiple fields missing
-                missing_list = "\n".join([f"❌ {field}" for field in missing_fields])
-                
-                if collected_text:
-                    return f"""I have the following information for the RFQ:
-
-{collected_text}
-
-I still need:
-{missing_list}
-
-Please provide the missing information.
-(RFQ Name is optional - I can generate one if not provided)"""
-                else:
-                    return f"""To create the RFQ, I need the following information:
-
-{missing_list}
-💡 RFQ Name (optional)
-
-Please provide these details."""
-        
-        # All required data available - validate and create RFQ
-        # Validate date format
-        try:
-            datetime.strptime(delivery_date, '%Y-%m-%d')
-        except ValueError:
-            return f"❌ Invalid delivery date format: {delivery_date}. Please use YYYY-MM-DD format (e.g., 2025-10-03)"
-        
-        # Validate quantity is numeric
-        try:
-            int(quantity)
-        except ValueError:
-            return f"❌ Invalid quantity: {quantity}. Please provide a valid number."
-        
-        logger.info(f"Creating RFQ with: Material={material_number}, Supplier={supplier_id}, Quantity={quantity}, Date={delivery_date}, Name={rfq_name or 'Auto-generated'}")
-        
-        # Create the RFQ with optional name
-        result = _create_sap_rfq_internal(material_number, supplier_id, quantity, delivery_date, rfq_name)
-        
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error in RFQ creation: {e}")
-        return f"❌ Error processing RFQ creation: {str(e)}"
 
 # Configure the model
 model = BedrockModel(
@@ -862,7 +704,7 @@ The [IMAGE] tag is how the frontend displays charts - it is REQUIRED.
         else:
             logger.warning("⚠️ [STREAMING] Running without memory")
         
-        # Create agent with session manager
+        # Create agent with MCP tools loaded at startup
         session_agent = Agent(
             session_manager=session_manager,
             model=model,
@@ -872,10 +714,9 @@ The [IMAGE] tag is how the frontend displays charts - it is REQUIRED.
                 get_financial_performance, 
                 get_supplier_quality_metrics, 
                 check_vendor_compliance, 
-                validate_rfq_data, 
-                create_sap_rfq,
+                validate_rfq_data,
                 execute_python
-            ],
+            ] + mcp_tools,
             system_prompt=SYSTEM_PROMPT_PREFIX + """You are a comprehensive SPA (Supplier Performance Analysis) assistant with advanced context awareness.
 
 CORE CAPABILITIES:
@@ -889,21 +730,15 @@ CORE CAPABILITIES:
 CONTEXT AWARENESS:
 You have access to the full conversation history. Use it to understand references to previously mentioned vendors, materials, and RFQ details. When users refer to "these vendors" or "that material", look back in the conversation to identify what they're referring to.
 
-RFQ CREATION INSTRUCTIONS:
-REQUIRED FIELDS:
-- Material Number (e.g., MZ-RM-C900-06)
-- Supplier ID (e.g., USSU-VSF01)
-- Quantity (e.g., 10)
-- Delivery Date (YYYY-MM-DD format, e.g., 2025-10-03)
+RFQ CREATION:
+Use the create_rfq tool when users want to create an RFQ. The tool requires:
+- material_number (required)
+- supplier_id (required)  
+- quantity (required)
+- delivery_date (required, YYYY-MM-DD format)
+- rfq_name (optional)
 
-OPTIONAL FIELDS:
-- RFQ Name (e.g., "TSTRFQ", "Q4 Material Procurement")
-
-When creating an RFQ:
-1. Check the conversation history for any previously mentioned details
-2. Extract all provided information from the current message
-3. Ask for any missing required fields
-4. Once you have all required data, call create_sap_rfq with a complete formatted string
+If the user provides all required fields, call the tool immediately. If fields are missing, the tool will indicate what's needed.
 
 VISUALIZATIONS - CRITICAL:
 ONLY use execute_python when user EXPLICITLY asks for charts, graphs, or visualizations.
@@ -917,7 +752,7 @@ When user asks for charts/graphs:
 4. Code must save chart to: plt.savefig('chart.png', bbox_inches='tight', dpi=150)
 
 TOOL SELECTION RULES:
-- RFQ creation → use create_sap_rfq(formatted_string_with_all_data)
+- RFQ creation → use create_rfq tool directly (from MCP Gateway)
 - Financial queries → use get_financial_performance()
 - Quality queries → use get_supplier_quality_metrics()
 - Compliance queries (show/get/list data) → use check_vendor_compliance() ONLY
@@ -1003,7 +838,7 @@ async def spa_multi_agent_system_streaming(payload):
         else:
             logger.warning("⚠️ [STREAMING] Running without memory")
         
-        # Create agent with session manager
+        # Create agent with MCP tools loaded at startup
         session_agent = Agent(
             session_manager=session_manager,
             model=model,
@@ -1013,10 +848,9 @@ async def spa_multi_agent_system_streaming(payload):
                 get_financial_performance, 
                 get_supplier_quality_metrics, 
                 check_vendor_compliance, 
-                validate_rfq_data, 
-                create_sap_rfq,
+                validate_rfq_data,
                 execute_python
-            ],
+            ] + mcp_tools,
             system_prompt="""You are a comprehensive SPA (Supplier Performance Analysis) assistant with advanced context awareness.
 
 CORE CAPABILITIES:
@@ -1112,7 +946,11 @@ RESPONSE STYLE:
 # Cleanup function
 def cleanup_memory():
     """Clean up memory resources on shutdown"""
+    global _mcp_client
     try:
+        if _mcp_client:
+            _mcp_client.__exit__(None, None, None)
+            logger.info("MCP client closed")
         if memory_id and client:
             # Don't delete production memory - just log cleanup
             logger.info(f"Application shutting down - Memory {memory_id} remains available")

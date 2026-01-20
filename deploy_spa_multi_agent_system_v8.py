@@ -389,6 +389,10 @@ def update_agent_config(agent_file, config):
         "os.getenv('SPA_MEMORY_ID')": f"'{config.get('spa_memory_id', '')}'",
         "os.getenv('SPA_MEMORY_NAME')": f"'{config.get('spa_memory_name', '')}'",
         "os.getenv('CODE_INTERPRETER_BUCKET', 'spa-code-interpreter-output')": f"'{config.get('code_interpreter_bucket', 'spa-code-interpreter-output')}'",
+        "os.getenv('GATEWAY_URL')": f"'{config.get('gateway_url', '')}'",
+        "os.getenv('GATEWAY_COGNITO_CLIENT_ID')": f"'{config.get('gateway_cognito_client_id', '')}'",
+        "os.getenv('GATEWAY_COGNITO_CLIENT_SECRET')": f"'{config.get('gateway_cognito_client_secret', '')}'",
+        "os.getenv('GATEWAY_TOKEN_URL')": f"'{config.get('gateway_token_url', '')}'",
     }
 
     for old, new in replacements.items():
@@ -415,6 +419,7 @@ requests>=2.31.0
 python-dateutil>=2.8.0
 jsonschema>=4.0.0
 pydantic>=2.0.0
+mcp
 """
     
     requirements_file = "requirements.txt"
@@ -458,6 +463,12 @@ def main():
     parser.add_argument('--cognito-user-pool-id', required=True, help='Cognito User Pool ID (e.g., us-east-1_xxxxx)')
     parser.add_argument('--cognito-client-id', required=True, help='Cognito App Client ID')
     parser.add_argument('--auto-update-on-conflict', action='store_true', help='Auto-update agent if it already exists')
+    
+    # Gateway parameters for MCP
+    parser.add_argument('--gateway-url', help='Gateway MCP URL (e.g., https://xxx.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp)')
+    parser.add_argument('--gateway-cognito-client-id', help='Gateway Cognito Client ID for OAuth2')
+    parser.add_argument('--gateway-cognito-client-secret', help='Gateway Cognito Client Secret for OAuth2')
+    parser.add_argument('--gateway-token-url', help='Gateway Cognito Token URL')
     
     args = parser.parse_args()
     
@@ -534,7 +545,11 @@ def main():
         'environment': args.environment,
         'spa_memory_id': spa_memory_id,
         'spa_memory_name': spa_memory_name,
-        'code_interpreter_bucket': code_interpreter_bucket
+        'code_interpreter_bucket': code_interpreter_bucket,
+        'gateway_url': args.gateway_url or '',
+        'gateway_cognito_client_id': args.gateway_cognito_client_id or '',
+        'gateway_cognito_client_secret': args.gateway_cognito_client_secret or '',
+        'gateway_token_url': args.gateway_token_url or ''
     }
     
     configured_agent_file = update_agent_config(original_agent_file, config)
@@ -550,28 +565,7 @@ def main():
             print(f"[WARNING] S3 bucket may not be configured correctly")
     
     # Step 7: Configure runtime with Cognito auth
-    print("\n5. Updating agent configuration...")
-    config = {
-        'region': args.region,
-        's3_output_bucket': args.s3_output_bucket,
-        'athena_database': args.athena_database,
-        'compliance_database': args.compliance_database,
-        'knowledge_base_id': args.knowledge_base_id,
-        'sap_url': args.sap_url,
-        'secret_name': args.secret_name,
-        'model_id': args.model_id,
-        'nova_model_id': args.nova_model_id,
-        'environment': args.environment,
-        'spa_memory_id': spa_memory_id,
-        'spa_memory_name': spa_memory_name,
-        'code_interpreter_bucket': code_interpreter_bucket
-    }
-    
-    configured_agent_file = update_agent_config(original_agent_file, config)
-    cleanup_files.append(configured_agent_file)
-    
-    # Step 6: Configure runtime with Cognito auth
-    print("\n6. Configuring AgentCore Runtime with Cognito Inbound Auth...")
+    print("\n7. Configuring AgentCore Runtime with Cognito Inbound Auth...")
     try:
         agentcore_runtime = Runtime()
         
@@ -604,7 +598,7 @@ def main():
         return
     
     # Step 7: Launch
-    print(f"\n7. Launching {args.agent_name}...")
+    print(f"\n8. Launching {args.agent_name}...")
     try:
         launch_result = agentcore_runtime.launch(auto_update_on_conflict=args.auto_update_on_conflict)
         print("[OK] Agent launch initiated")
@@ -616,7 +610,7 @@ def main():
         return
     
     # Step 8: Monitor status
-    print(f"\n8. Monitoring deployment...")
+    print(f"\n9. Monitoring deployment...")
     status = "CREATING"
     max_attempts = 60
     attempt = 0
@@ -651,6 +645,7 @@ def main():
         return
     
     # Step 9: Save deployment info
+    print("\n10. Saving deployment info...")
     deployment_info = {
         "agent_name": args.agent_name,
         "agent_arn": launch_result.agent_arn,

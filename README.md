@@ -41,7 +41,7 @@ RFQ Assistant is a comprehensive multi-agent system that helps procurement teams
 
 ## Architecture
 
-![RFQ Assistant Architecture](blob/img/Architecture.png)
+![RFQ Assistant Architecture](img/Architecture.png)
 
 ## Prerequisites
 
